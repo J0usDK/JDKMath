@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <vector>
 #include <iterator>
+#include <limits>
 
 #include "MathConfig.h"
 #include "MathAssert.h"
@@ -38,7 +39,7 @@ namespace JDK::Math::BitmaskRank
 #endif
 		inline void BuildRanks_AVX512(const uint64_t* pBitmask, size_t count, TRank* pRanks, TRank& outTotalRank) noexcept
 		{
-			if constexpr (sizeof(TRank) < 2 || sizeof(TRank) > 8)
+			if constexpr (sizeof(TRank) > 8)
 			{
 				BuildRanks_Scalar<TRank>(pBitmask, count, pRanks, outTotalRank);
 				return;
@@ -90,8 +91,7 @@ namespace JDK::Math::BitmaskRank
 					else if constexpr (sizeof(TRank) == 1)
 					{
 						__m128i ranks8 = _mm512_cvtepi64_epi8(finalRanks64);
-						int64_t val64 = _mm_cvtsi128_si64(ranks8);
-						*reinterpret_cast<int64_t*>(pRanks + i) = val64;
+						_mm_storel_epi64(reinterpret_cast<__m128i*>(pRanks + i), ranks8);
 					}
 
 					globalRank += static_cast<TRank>(_mm512_reduce_add_epi64(popcnts));
@@ -180,7 +180,7 @@ namespace JDK::Math::BitmaskRank
 					else if constexpr (sizeof(TLocalRank) == 1)
 					{
 						__m128i ranks8 = _mm512_cvtepi64_epi8(finalRanks64);
-						*reinterpret_cast<int64_t*>(pLocalRanks + offset) = _mm_cvtsi128_si64(ranks8);
+						_mm_storel_epi64(reinterpret_cast<__m128i*>(pLocalRanks + offset), ranks8);
 					}
 
 					currentLocalRank += static_cast<TSuperRank>(_mm512_reduce_add_epi64(popcnts));
@@ -230,7 +230,7 @@ namespace JDK::Math::BitmaskRank
 #if defined(__GNUC__) || defined(__clang__)
 		__attribute__((target("avx512f,avx512vl,avx512bw,avx512vpopcntdq")))
 #endif
-		inline void GetRanksBatch_AVX512(const uint64_t* pBitmask, const TRank* pRanks, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) noexcept
+		inline void GetRanksBatch_AVX512(const uint64_t* pBitmask, const TRank* pRanks, size_t safeLimit, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) noexcept
 		{
 			const __mmask8 loadMask = (1 << count) - 1;
 
@@ -259,18 +259,42 @@ namespace JDK::Math::BitmaskRank
 			}
 			else
 			{
-				__m256i baseRanks32 = _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), validMask, blockIndices, pRanks, sizeof(TRank));
+				__mmask8 safeMask = validMask;
+				__mmask8 unsafeMask = 0;
 
-				if constexpr (sizeof(TRank) == 2)
-					baseRanks32 = _mm256_and_si256(baseRanks32, _mm256_set1_epi32(0xFFFF));
-				else if constexpr (sizeof(TRank) == 1)
-					baseRanks32 = _mm256_and_si256(baseRanks32, _mm256_set1_epi32(0xFF));
+				if constexpr (sizeof(TRank) < 4)
+				{
+					__m512i vecSafeLimit = _mm512_set1_epi64(safeLimit);
+					unsafeMask = _mm512_cmpge_epi64_mask(blockIndices, vecSafeLimit) & validMask;
+					safeMask = validMask & ~unsafeMask;
+				}
+
+				__m256i baseRanks32 = _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), safeMask, blockIndices, pRanks, sizeof(TRank));
+
+				if constexpr (sizeof(TRank) < 4)
+				{
+					alignas(64) uint64_t bIdxArr[8];
+					alignas(32) uint32_t rArr[8];
+					_mm512_store_si512(bIdxArr, blockIndices);
+					_mm256_store_si256(reinterpret_cast<__m256i*>(rArr), baseRanks32);
+
+					for (size_t k = 0; k < count; ++k)
+						if ((unsafeMask >> k) & 1)
+							rArr[k] = static_cast<uint32_t>(pRanks[bIdxArr[k]]);
+
+					baseRanks32 = _mm256_load_si256(reinterpret_cast<const __m256i*>(rArr));
+
+					if constexpr (sizeof(TRank) == 2)
+						baseRanks32 = _mm256_and_si256(baseRanks32, _mm256_set1_epi32(0xFFFF));
+					else if constexpr (sizeof(TRank) == 1)
+						baseRanks32 = _mm256_and_si256(baseRanks32, _mm256_set1_epi32(0xFF));
+				}
 
 				baseRanks64 = _mm512_cvtepu32_epi64(baseRanks32);
 			}
 
 			__m512i finalRanks64 = _mm512_add_epi64(baseRanks64, localRanks64);
-			const TRank invalidValue = std::numeric_limits<TRank>::max();
+			const TRank invalidValue = std::numeric_limits<uint64_t>::max();
 			__m512i invalidFill = _mm512_set1_epi64(invalidValue);
 			__m512i result = _mm512_mask_blend_epi64(validMask, invalidFill, finalRanks64);
 			_mm512_mask_storeu_epi64(pOutRanks, loadMask, result);
@@ -304,7 +328,7 @@ namespace JDK::Math::BitmaskRank
 #if defined(__GNUC__) || defined(__clang__)
 		__attribute__((target("avx512f,avx512vl,avx512bw,avx512vpopcntdq")))
 #endif
-		inline void GetTwoLevelRanksBatch_AVX512(const uint64_t* pBitmask, const TSuperRank* pSuperRanks, const TLocalRank* pLocalRanks, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) noexcept
+		inline void GetTwoLevelRanksBatch_AVX512(const uint64_t* pBitmask, const TSuperRank* pSuperRanks, size_t superRanksSafeLimit, const TLocalRank* pLocalRanks, size_t localRanksSafeLimit, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) noexcept
 		{
 			const __mmask8 loadMask = (1 << count) - 1;
 
@@ -329,11 +353,39 @@ namespace JDK::Math::BitmaskRank
 				superRanks64 = _mm512_mask_i64gather_epi64(_mm512_setzero_si512(), validMask, superIndices, pSuperRanks, 8);
 			else
 			{
-				__m256i sr32 = _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), validMask, superIndices, pSuperRanks, sizeof(TSuperRank));
-				if constexpr (sizeof(TSuperRank) == 2)
-					sr32 = _mm256_and_si256(sr32, _mm256_set1_epi32(0xFFFF));
-				if constexpr (sizeof(TSuperRank) == 1)
-					sr32 = _mm256_and_si256(sr32, _mm256_set1_epi32(0xFF));
+				__mmask8 safeSuperMask = validMask;
+				__mmask8 unsafeSuperMask = 0;
+
+				if constexpr (sizeof(TSuperRank) < 4)
+				{
+					__m512i vecSafeLimit = _mm512_set1_epi64(superRanksSafeLimit >> 5);
+					unsafeSuperMask = _mm512_cmpge_epi64_mask(superIndices, vecSafeLimit) & validMask;
+					safeSuperMask = validMask & ~unsafeSuperMask;
+				}
+
+				__m256i sr32 = _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), safeSuperMask, superIndices, pSuperRanks, sizeof(TSuperRank));
+				
+				if constexpr (sizeof(TSuperRank) < 4)
+				{
+					if (unsafeSuperMask != 0)
+					{
+						alignas(64) uint64_t sIdxArr[8];
+						alignas(32) uint32_t srArr[8];
+						_mm512_store_si512(sIdxArr, superIndices);
+						_mm256_store_si256(reinterpret_cast<__m256i*>(srArr), sr32);
+
+						for (size_t k = 0; k < count; ++k)
+							if ((unsafeSuperMask >> k) & 1)
+								srArr[k] = static_cast<uint32_t>(pSuperRanks[sIdxArr[k]]);
+
+						sr32 = _mm256_load_si256(reinterpret_cast<const __m256i*>(srArr));
+					}
+
+					if constexpr (sizeof(TSuperRank) == 2)
+						sr32 = _mm256_and_si256(sr32, _mm256_set1_epi32(0xFFFF));
+					if constexpr (sizeof(TSuperRank) == 1)
+						sr32 = _mm256_and_si256(sr32, _mm256_set1_epi32(0xFF));
+				}
 				superRanks64 = _mm512_cvtepu32_epi64(sr32);
 			}
 
@@ -342,18 +394,47 @@ namespace JDK::Math::BitmaskRank
 				localRanks64 = _mm512_mask_i64gather_epi64(_mm512_setzero_si512(), validMask, blockIndices, pLocalRanks, 8);
 			else
 			{
-				__m256i lr32 = _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), validMask, blockIndices, pLocalRanks, sizeof(TLocalRank));
-				if constexpr (sizeof(TLocalRank) == 2)
-					lr32 = _mm256_and_si256(lr32, _mm256_set1_epi32(0xFFFF));
-				if constexpr (sizeof(TLocalRank) == 1)
-					lr32 = _mm256_and_si256(lr32, _mm256_set1_epi32(0xFF));
+				__mmask8 safeLocalMask = validMask;
+				__mmask8 unsafeLocalMask = 0;
+
+				if constexpr (sizeof(TLocalRank) < 4)
+				{
+					__m512i vecSafeLimit = _mm512_set1_epi64(localRanksSafeLimit);
+					unsafeLocalMask = _mm512_cmpge_epi64_mask(blockIndices, vecSafeLimit) & validMask;
+					safeLocalMask = validMask & ~unsafeLocalMask;
+				}
+
+				__m256i lr32 = _mm512_mask_i64gather_epi32(_mm256_setzero_si256(), safeLocalMask, blockIndices, pLocalRanks, sizeof(TLocalRank));
+				
+				if constexpr (sizeof(TLocalRank) < 4)
+				{
+					if (unsafeLocalMask != 0)
+					{
+						alignas(64) uint64_t bIdxArr[8];
+						alignas(32) uint32_t lrArr[8];
+						_mm512_store_si512(bIdxArr, blockIndices);
+						_mm256_store_si256(reinterpret_cast<__m256i*>(lrArr), lr32);
+
+						for (size_t k = 0; k < count; ++k)
+							if ((unsafeLocalMask >> k) & 1)
+								lrArr[k] = static_cast<uint32_t>(pLocalRanks[bIdxArr[k]]);
+
+						lr32 = _mm256_load_si256(reinterpret_cast<const __m256i*>(lrArr));
+					}
+
+					if constexpr (sizeof(TLocalRank) == 2)
+						lr32 = _mm256_and_si256(lr32, _mm256_set1_epi32(0xFFFF));
+					if constexpr (sizeof(TLocalRank) == 1)
+						lr32 = _mm256_and_si256(lr32, _mm256_set1_epi32(0xFF));
+				}
+
 				localRanks64 = _mm512_cvtepu32_epi64(lr32);
 			}
 
 			__m512i finalRanks64 = _mm512_add_epi64(superRanks64, localRanks64);
 			finalRanks64 = _mm512_add_epi64(finalRanks64, popcntRanks64);
 
-			const TSuperRank invalidValue = std::numeric_limits<TSuperRank>::max();
+			const TSuperRank invalidValue = std::numeric_limits<uint64_t>::max();
 			__m512i invalidFill = _mm512_set1_epi64(invalidValue);
 			__m512i result = _mm512_mask_blend_epi64(validMask, invalidFill, finalRanks64);
 			_mm512_mask_storeu_epi64(pOutRanks, loadMask, result);
@@ -388,7 +469,7 @@ namespace JDK::Math::BitmaskRank
 	 * @note TRank must be able to represent the maximum possible rank.
 	*/
 	template<typename TRank = uint32_t>
-	inline void Build(const std::vector<uint64_t>& bitmask, std::vector<TRank>& ranks, TRank& outTotalRank)
+	inline void Build(const std::vector<uint64_t>& bitmask, std::vector<TRank>& ranks, TRank& outTotalRank) noexcept
 	{
 		static_assert(Math::Internal::IsSupportedRankType<TRank>, "TRank must be uint8_t, uint16_t, uint32_t or uint64_t");
 
@@ -431,7 +512,7 @@ namespace JDK::Math::BitmaskRank
 	 * @note TSuperRank and TLocalRank must be able to represent the maximum possible rank.
 	*/
 	template<typename TSuperRank = uint32_t, typename TLocalRank = uint16_t>
-	inline void BuildTwoLevel(const std::vector<uint64_t>& bitmask, std::vector<TSuperRank>& superRanks, std::vector<TLocalRank>& localRanks, TSuperRank& outTotalRank)
+	inline void BuildTwoLevel(const std::vector<uint64_t>& bitmask, std::vector<TSuperRank>& superRanks, std::vector<TLocalRank>& localRanks, TSuperRank& outTotalRank) noexcept
 	{
 		static_assert(Math::Internal::IsSupportedRankType<TSuperRank>, "TSuperRank must be uint8_t, uint16_t, uint32_t or uint64_t");
 		static_assert(Math::Internal::IsSupportedRankType<TLocalRank>, "TLocalRank must be uint8_t, uint16_t, uint32_t or uint64_t");
@@ -467,27 +548,32 @@ namespace JDK::Math::BitmaskRank
 	 * @tparam TRank Unsigned rank type. Must be uint8_t, uint16_t, uint32_t, or uint64_t.
 	 * 
 	 * @param bitmask		Source bitmask.
-	 * @param ranks			The cumulative rank table computed by Build().
-	 * @param indices		Input array of bit indices to query.
-	 * @param outRanks		Output array where the computed ranks will be stored.
-	 *						Missing indices will yield std::numeric_limits<TRank>::max().
+	 * @param pRanks		The cumulative rank table computed by Build().
+	 * @param ranksCapacity	The physical memory (in elements) of the pRanks array.
+	 * @param pIndices		Input array of bit indices to query.
+	 * @param pOutRanks		Output array where the computed ranks will be stored.
+	 *						Missing or out-of-bounds indices will yield std::numeric_limits<uint64_t>::max().
 	 * @param count			The number of indices to process. Must be in [1, 8].
 	*/
 	template<typename TRank = uint32_t>
-	inline void GetRanksBatch(const std::vector<uint64_t>& bitmask, const TRank* pRanks, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count)
+	inline void GetRanksBatch(const std::vector<uint64_t>& bitmask, const TRank* pRanks, size_t ranksCapacity, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) noexcept
 	{
 		static_assert(Math::Internal::IsSupportedRankType<TRank>, "TRank must be uint8_t, uint16_t, uint32_t or uint64_t");
 		JDK_MATH_ASSERT(count > 0 && count <= 8, "JDKMath: GetRanksBatch supports strict count from 1 to 8 elements");
-		if (count == 0 || count > 8)
-			return;
+		JDK_MATH_ASSERT(!bitmask.empty(), "JDKMath: GetRanksBatch must receive not empty bitmask");
+
+		size_t safeLimit = ranksCapacity - 1;
+
+		const uintptr_t lastElementAddr = reinterpret_cast<uintptr_t>(pRanks + safeLimit);
+		safeLimit += ((lastElementAddr & 4095) <= 4092);
 
 #if JDK_MATH_DISPATCH_AVX512_RANK_GETBATCH == 1
-		Internal::GetRanksBatch_AVX512<TRank>(bitmask.data(), pRanks, pIndices, pOutRanks, count);
+		Internal::GetRanksBatch_AVX512<TRank>(bitmask.data(), pRanks, safeLimit, pIndices, pOutRanks, count);
 #elif JDK_MATH_DISPATCH_AVX512_RANK_GETBATCH == 0
 		Internal::GetRanksBatch_Scalar<TRank>(bitmask.data(), pRanks, pIndices, pOutRanks, count);
 #else
 		if (CanUseGetBatchAVX512())
-			Internal::GetRanksBatch_AVX512<TRank>(bitmask.data(), pRanks, pIndices, pOutRanks, count);
+			Internal::GetRanksBatch_AVX512<TRank>(bitmask.data(), pRanks, safeLimit, pIndices, pOutRanks, count);
 		else
 			Internal::GetRanksBatch_Scalar<TRank>(bitmask.data(), pRanks, pIndices, pOutRanks, count);
 #endif
@@ -499,31 +585,40 @@ namespace JDK::Math::BitmaskRank
 	 * @tparam TSuperRank Unsigned rank type. Must be uint8_t, uint16_t, uint32_t, or uint64_t.
 	 * @tparam TLocalRank Unsigned rank type. Must be uint8_t, uint16_t, uint32_t, or uint64_t.
 	 *
-	 * @param bitmask		bitmask Source bitmask.
-	 * @param superRanks	The super rank table computed by BuildTwoLevel().
-	 * @param localRanks	The local rank table computed by BuildTwoLevel().
-	 * @param indices		Input array of bit indices to query.
-	 * @param outRanks		Output array where the computed ranks will be stored.
-	 *						Missing indices will yield std::numeric_limits<TSuperRank>::max().
-	 * @param count			The number of indices to process. Must be in [1, 8].
+	 * @param bitmask				bitmask Source bitmask.
+	 * @param pSuperRanks			The super rank table computed by BuildTwoLevel().
+	 * @param superRanksCapacity	The physical memory capacity (in elements) of the pSuperRanks array.
+	 * @param pLocalRanks			The local rank table computed by BuildTwoLevel().
+	 * @param localRanksCapacity	The physical memory capacity (in elements) of the pLocalRanks array.
+	 * @param pIndices				Input array of bit indices to query.
+	 * @param pOutRanks				Output array where the computed ranks will be stored.
+	 *								Missing or out-of-bounds indices will yield std::numeric_limits<uint64_t>::max().
+	 * @param count					The number of indices to process. Must be in [1, 8].
 	*/
 	template<typename TSuperRank = uint32_t, typename TLocalRank = uint16_t>
-	inline void GetTwoLevelRanksBatch(const std::vector<uint64_t>& bitmask, const TSuperRank* pSuperRanks, const TLocalRank* pLocalRanks, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count)
+	inline void GetTwoLevelRanksBatch(const std::vector<uint64_t>& bitmask, const TSuperRank* pSuperRanks, size_t superRanksCapacity, const TLocalRank* pLocalRanks, size_t localRanksCapacity, const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) noexcept
 	{
 		static_assert(Math::Internal::IsSupportedRankType<TSuperRank>, "TSuperRank must be uint8_t, uint16_t, uint32_t or uint64_t");
 		static_assert(Math::Internal::IsSupportedRankType<TLocalRank>, "TLocalRank must be uint8_t, uint16_t, uint32_t or uint64_t");
 		JDK_MATH_ASSERT(count > 0 && count <= 8, "JDKMath: GetTwoLevelRanksBatch supports strict count from 1 to 8 elements");
+		JDK_MATH_ASSERT(!bitmask.empty(), "JDKMath: GetTwoLevelRanksBatch must receive not empty bitmask");
 
-		if (count == 0 || count > 8)
-			return;
+		size_t safeLocalLimit = localRanksCapacity - 1;
+		size_t safeSuperLimit = superRanksCapacity - 1;
+
+		const uintptr_t lastLocalAddr = reinterpret_cast<uintptr_t>(pLocalRanks + safeLocalLimit);
+		safeLocalLimit += ((lastLocalAddr & 4095) <= 4092);
+
+		const uintptr_t lastSuperAddr = reinterpret_cast<uintptr_t>(pSuperRanks + safeSuperLimit);
+		safeSuperLimit += ((lastSuperAddr & 4095) <= 4092);
 
 #if JDK_MATH_DISPATCH_AVX512_RANK_GETBATCH == 1
-		Internal::GetTwoLevelRanksBatch_AVX512<TSuperRank, TLocalRank>(bitmask.data(), pSuperRanks, pLocalRanks, pIndices, pOutRanks, count);
+		Internal::GetTwoLevelRanksBatch_AVX512<TSuperRank, TLocalRank>(bitmask.data(), pSuperRanks, safeSuperLimit, pLocalRanks, safeLocalLimit, pIndices, pOutRanks, count);
 #elif JDK_MATH_DISPATCH_AVX512_RANK_GETBATCH == 0
 		Internal::GetTwoLevelRanksBatch_Scalar<TSuperRank, TLocalRank>(bitmask.data(), pSuperRanks, pLocalRanks, pIndices, pOutRanks, count);
 #else
 		if (CanUseGetBatchAVX512())
-			Internal::GetTwoLevelRanksBatch_AVX512<TSuperRank, TLocalRank>(bitmask.data(), pSuperRanks, pLocalRanks, pIndices, pOutRanks, count);
+			Internal::GetTwoLevelRanksBatch_AVX512<TSuperRank, TLocalRank>(bitmask.data(), pSuperRanks, safeSuperLimit, pLocalRanks, safeLocalLimit, pIndices, pOutRanks, count);
 		else
 			Internal::GetTwoLevelRanksBatch_Scalar<TSuperRank, TLocalRank>(bitmask.data(), pSuperRanks, pLocalRanks, pIndices, pOutRanks, count);
 #endif

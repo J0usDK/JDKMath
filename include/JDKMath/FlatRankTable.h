@@ -36,6 +36,9 @@ namespace JDK::Math
 			if (bitmask.empty())
 				return;
 
+			constexpr size_t simdPadding = (sizeof(TRank) < 4) ? ((4 - sizeof(TRank)) / sizeof(TRank)) : 0;
+
+			m_ranks.reserve(bitmask.size() + simdPadding);
 			m_ranks.resize(bitmask.size());
 			BitmaskRank::Build<TRank>(*m_pBitmask, m_ranks, m_totalRank);
 		}
@@ -76,7 +79,7 @@ namespace JDK::Math
 		inline void GetRanksBatch(const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) const noexcept
 		{
 			JDK_MATH_ASSERT(m_pBitmask != nullptr, "GetRanksBatch called before Build");
-			BitmaskRank::GetRanksBatch<TRank>(*m_pBitmask, m_ranks.data(), pIndices, pOutRanks, count);
+			BitmaskRank::GetRanksBatch<TRank>(*m_pBitmask, m_ranks.data(), m_ranks.capacity(), pIndices, pOutRanks, count);
 		}
 
 		/**

@@ -21,6 +21,7 @@ namespace JDK::Math
 	{
 		static_assert(Internal::IsSupportedRankType<TSuperRank>, "TSuperRank must be uint8_t, uint16_t, uint32_t or uint64_t");
 		static_assert(Internal::IsSupportedRankType<TLocalRank>, "TLocalRank must be uint8_t, uint16_t, uint32_t or uint64_t");
+		static_assert(sizeof(TLocalRank) >= 2, "TLocalRank must be at least uint16_t to prevent overflow");
 
 	public:
 		/**
@@ -39,9 +40,15 @@ namespace JDK::Math
 			if (bitmask.empty())
 				return;
 
-			const size_t count = bitmask.size();
-			m_superRanks.resize((count + 31) / 32);
-			m_localRanks.resize(count);
+
+			const size_t localCount = bitmask.size();
+			const size_t superCount = (localCount + 31) / 32;
+
+			constexpr size_t simdLocalPadding = (sizeof(TLocalRank) < 4) ? ((4 - sizeof(TLocalRank)) / sizeof(TLocalRank)) : 0;
+			constexpr size_t simdSuperPadding = (sizeof(TSuperRank) < 4) ? ((4 - sizeof(TSuperRank)) / sizeof(TSuperRank)) : 0;
+
+			m_localRanks.resize(localCount + simdLocalPadding);
+			m_superRanks.resize(superCount + simdSuperPadding);
 
 			BitmaskRank::BuildTwoLevel<TSuperRank, TLocalRank>(*m_pBitmask, m_superRanks, m_localRanks, m_totalRank);
 		}
@@ -86,7 +93,7 @@ namespace JDK::Math
 		inline void GetRanksBatch(const uint64_t* pIndices, uint64_t* pOutRanks, size_t count) const noexcept
 		{
 			JDK_MATH_ASSERT(m_pBitmask != nullptr, "GetRanksBatch called before Build");
-			BitmaskRank::GetTwoLevelRanksBatch<TSuperRank, TLocalRank>(*m_pBitmask, m_superRanks.data(), m_localRanks.data(), pIndices, pOutRanks, count);
+			BitmaskRank::GetTwoLevelRanksBatch<TSuperRank, TLocalRank>(*m_pBitmask, m_superRanks.data(), m_superRanks.capacity(), m_localRanks.data(), m_localRanks.capacity(), pIndices, pOutRanks, count);
 		}
 
 		/**
