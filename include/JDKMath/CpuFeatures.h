@@ -12,6 +12,8 @@ namespace JDK::Math
 	struct SCpuFeatures
 	{
 		bool bHasPopcnt				= false;
+		bool bHasSSE2				= false;
+		bool bHasSSE41				= false;
 		bool bHasAVX512F			= false;
 		bool bHasAVX512VL			= false;
 		bool bHasAVX512BW			= false;
@@ -28,6 +30,8 @@ namespace JDK::Math
 			int info[4];
 			__cpuid(info, 1);
 			features.bHasPopcnt = (info[2] & (1 << 23)) != 0;
+			features.bHasSSE2 = (info[3] & (1 << 26)) != 0;
+			features.bHasSSE41 = (info[2] & (1 << 19)) != 0;
 
 			__cpuidex(info, 7, 0);
 			features.bHasAVX512F = (info[1] & (1 << 16)) != 0;
